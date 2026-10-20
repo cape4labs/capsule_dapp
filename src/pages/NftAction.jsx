@@ -1,0 +1,330 @@
+
+import { useEffect, useState } from "react";
+import { useConnection } from "wagmi";
+import { useQueryClient } from "@tanstack/react-query";
+import { erc721Abi, isAddress } from "viem";
+import Icon from "../components/Icon";
+import ActionLayout, { SummaryCard } from "../components/ActionLayout";
+import { Field, DateInput, SelectInput, Checkbox } from "../components/Field";
+import { PAGES_NFT } from "../lib/constants";
+import {
+  CONTRACTS,
+  BURN_METHODS,
+  DAY,
+  routerAbi,
+  toUnix,
+  isFuture,
+} from "../lib/contracts";
+import { useTx } from "../hooks/useTx";
+import { useOwnedNfts } from "../hooks/useOwnedNfts";
+import { publicClient as client } from "../lib/wagmi";
+
+const DONE = {
+  Lock: "NFTs locked",
+  Burn: "NFTs burned",
+};
+
+function NftPicker({ ids, selected, onToggle }) {
+  return (
+    <div className="nft-grid">
+      {ids.map((raw, i) => {
+        const id = String(raw);
+        const on = selected.includes(id);
+
+        return (
+          <button
+            type="button"
+            key={id}
+            aria-pressed={on}
+            className={`nft nft--${i % 4} ${on ? "is-selected" : ""}`}
+            onClick={() => onToggle(id)}
+          >
+            {on && (
+              <span className="nft__check">
+                <Icon name="check" size={10} />
+              </span>
+            )}
+            <Icon name="cube" size={16} />
+            <span>#{id}</span>
+          </button>
+        );
+      })}
+    </div>
+  );
+}
+
+export default function NftAction({ tab, base }) {
+  const { address, isConnected } = useConnection();
+
+  const [collection, setCollection] = useState("");
+  const [selected, setSelected] = useState([]);
+  const [date, setDate] = useState("");
+  const [interval, setIntervalDays] = useState("");
+  const [perBatch, setPerBatch] = useState("");
+  const [method, setMethod] = useState("");
+  const [agreed, setAgreed] = useState(false);
+  const [wantsReward, setWantsReward] = useState(true);
+  const [progress, setProgress] = useState("");
+
+  const tx = useTx();
+  const queryClient = useQueryClient();
+  const nfts = useOwnedNfts(collection);
+
+  useEffect(() => {
+    tx.reset();
+  }, [tab]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  const toggle = (id) => {
+    setSelected((current) =>
+      current.includes(id)
+        ? current.filter((item) => item !== id)
+        : [...current, id]
+    );
+  };
+
+  const dateOk = isFuture(date);
+  const feeRow = ["Fee:", "gas only"];
+  const rewardRow = ["Reward:", wantsReward ? "yes" : "no"];
+
+  const blocker = !isConnected ? "Connect your wallet"
+    : !isAddress(collection) ? "Enter a collection address"
+    : selected.length === 0 ? "Select at least one NFT"
+    : tab === "Lock" && !dateOk ? "Enter a valid future date"
+    : tab === "Burn" && !method ? "Select a burn method"
+    : tab === "Burn" && !agreed ? "Confirm the action"
+    : "";
+  const ready = !blocker;
+
+  const rows = {
+    Lock: [
+      ["Unlocks:", date || "XX.XX.XXXX"],
+      rewardRow,
+      feeRow,
+    ],
+    Burn: [
+      [
+        "Destination:",
+        method
+          ? BURN_METHODS[method]
+            ? "Burned"
+            : "Vault, 1000 years"
+          : "—",
+      ],
+      rewardRow,
+      feeRow,
+    ],
+  }[tab] ?? [];
+
+  const submit = async () => {
+    const perBatchN = Math.max(1, Math.floor(Number(perBatch) || 1));
+
+    const unlockAt = (i) =>
+      toUnix(date) +
+      BigInt(Math.floor(i / perBatchN)) *
+        BigInt(Math.floor(Number(interval))) *
+        DAY;
+
+    try {
+      for (const [i, label] of selected.entries()) {
+        setProgress(`${i + 1}/${selected.length}`);
+
+        const id = BigInt(label);
+
+        const read = (functionName, args) =>
+          client.readContract({
+            address: collection,
+            abi: erc721Abi,
+            functionName,
+            args,
+          });
+
+        const [approved, approvedAll] = await Promise.all([
+          read("getApproved", [id]),
+          read("isApprovedForAll", [address, CONTRACTS.router]),
+        ]);
+
+        if (
+          approved.toLowerCase() !== CONTRACTS.router.toLowerCase() &&
+          !approvedAll
+        ) {
+          await tx.send({
+            address: collection,
+            abi: erc721Abi,
+            functionName: "approve",
+            args: [CONTRACTS.router, id],
+          });
+        }
+
+        const call =
+          tab === "Burn"
+            ? {
+                functionName: "disposeERC721",
+                args: [
+                  collection,
+                  id,
+                  BURN_METHODS[method],
+                  wantsReward,
+                ],
+              }
+            : {
+                functionName: "lock",
+                args: [
+                  collection,
+                  id,
+                  address,
+                  tab === "Lock" ? toUnix(date) : unlockAt(i),
+                  wantsReward,
+                ],
+              };
+
+        await tx.send(
+          {
+            address: CONTRACTS.router,
+            abi: routerAbi,
+            ...call,
+          },
+          { final: i === selected.length - 1 }
+        );
+      }
+
+      setSelected([]);
+    } catch {
+      // Transaction errors are stored in tx.error.
+    }
+
+    queryClient.invalidateQueries({ queryKey: ["nfts"] });
+    queryClient.invalidateQueries({ queryKey: ["positions"] });
+    setProgress("");
+  };
+
+  let nftsStatus = "";
+
+  if (!isConnected) {
+    nftsStatus = "Connect wallet to see your NFTs";
+  } else if (!isAddress(collection)) {
+    nftsStatus = "Enter collection address";
+  } else if (nfts.error) {
+    nftsStatus = nfts.error.message;
+  } else if (nfts.isPending) {
+    nftsStatus = "Loading NFTs...";
+  } else if (!nfts.data.ids.length) {
+    nftsStatus = "You have no NFTs from this collection";
+  }
+
+  const dateError = date && !dateOk && (
+    <small className="error" role="alert">
+      Enter a valid future date
+    </small>
+  );
+
+  const form = (
+    <>
+      <Field
+        label="Collection"
+        hint={nfts.data?.name ?? "Collection name"}
+        onchain="read"
+      >
+        <input
+          value={collection}
+          placeholder="0x… collection address"
+          onChange={(e) => {
+            setCollection(e.target.value.trim());
+            setSelected([]);
+          }}
+        />
+      </Field>
+
+      <Field label="NFTs" onchain="read">
+        <input
+          readOnly
+          value={selected.map((id) => `#${id}`).join(", ")}
+          placeholder="Select NFTs below"
+        />
+      </Field>
+
+      {nftsStatus ? (
+        <p
+          className="nft-empty muted"
+          role={nfts.error ? "alert" : undefined}
+        >
+          {nftsStatus}
+        </p>
+      ) : (
+        <NftPicker
+          ids={nfts.data.ids}
+          selected={selected}
+          onToggle={toggle}
+        />
+      )}
+
+      {tab === "Lock" && (
+        <>
+          <Field label="Unlock date">
+            <DateInput value={date} onChange={setDate} />
+          </Field>
+          {dateError}
+        </>
+      )}
+
+      {tab === "Burn" && (
+        <>
+          <Field label="Burn method">
+            <SelectInput
+              value={method}
+              onChange={setMethod}
+              options={Object.keys(BURN_METHODS)}
+              placeholder="Select method"
+            />
+          </Field>
+
+          <Checkbox checked={agreed} onChange={setAgreed}>
+            I confirm this action
+          </Checkbox>
+        </>
+      )}
+
+      <Checkbox checked={wantsReward} onChange={setWantsReward}>
+        Receive $CAPS as a reward
+      </Checkbox>
+      
+      {blocker && <small className="muted">{blocker}</small>}
+      {tx.error && (
+        <small className="error" role="alert">
+          {tx.error}
+        </small>
+      )}
+    </>
+  );
+
+  return (
+    <ActionLayout
+      type="nft"
+      label="NFT"
+      icon="cube"
+      tab={tab}
+      base={base}
+      short={tab === "Burn"}
+      form={form}
+      summary={
+        <SummaryCard
+          icon="cube"
+          headline={`${selected.length} NFT`}
+          rows={rows}
+          cta={
+            progress
+              ? `Sending ${progress}…`
+              : PAGES_NFT[tab]?.cta ?? "Submit"
+          }
+          disabled={!ready || !!progress}
+          onClick={submit}
+          onchain="write"
+          success={
+            tx.success
+              ? { hash: tx.hash, text: DONE[tab] }
+              : null
+          }
+        />
+      }
+    />
+  );
+}
